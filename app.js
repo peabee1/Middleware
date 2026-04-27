@@ -584,6 +584,10 @@ function renderScalar(data) {
   return pre;
 }
 
+// Tracks the most recently rendered Copy button so submit() can flag it
+// as "Copied" once the auto-clipboard write completes.
+let lastCopyBtn = null;
+
 function renderResult(data) {
   $result.innerHTML = '';
 
@@ -619,6 +623,7 @@ function renderResult(data) {
   labelEl.className = 'result-label';
   labelEl.textContent = label;
   const copyBtn = makeCopyButton(copyText);
+  lastCopyBtn = copyBtn;
   header.appendChild(labelEl);
   header.appendChild(copyBtn);
 
@@ -629,6 +634,8 @@ function renderResult(data) {
   card.appendChild(header);
   card.appendChild(body);
   $result.appendChild(card);
+
+  return copyText;
 }
 
 function renderError(err) {
@@ -650,6 +657,7 @@ function renderError(err) {
     labelWrap.appendChild(code);
   }
   const copyBtn = makeCopyButton(copyText);
+  lastCopyBtn = copyBtn;
   header.appendChild(labelWrap);
   header.appendChild(copyBtn);
 
@@ -677,6 +685,8 @@ function renderError(err) {
   card.appendChild(header);
   card.appendChild(body);
   $result.appendChild(card);
+
+  return copyText;
 }
 
 function makeCopyButton(text) {
@@ -684,52 +694,102 @@ function makeCopyButton(text) {
   btn.className = 'copy-btn';
   btn.type = 'button';
   btn.textContent = 'Copy';
-  btn.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      btn.textContent = 'Copied';
-      btn.classList.add('copied');
-      setTimeout(() => {
-        btn.textContent = 'Copy';
-        btn.classList.remove('copied');
-      }, 1400);
-    } catch (e) {
-      // Fallback: select-and-copy via a hidden textarea
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand('copy'); btn.textContent = 'Copied'; }
-      catch (_) { btn.textContent = 'Copy failed'; }
-      document.body.removeChild(ta);
-      setTimeout(() => { btn.textContent = 'Copy'; }, 1400);
-    }
-  });
+  btn.addEventListener('click', () => copyToClipboard(text, btn));
   return btn;
+}
+
+// Visual "Copied" state on a button, reverting after a beat.
+function flashCopied(btn, label = 'Copied') {
+  if (!btn) return;
+  btn.textContent = label;
+  btn.classList.add('copied');
+  clearTimeout(btn._copyTimer);
+  btn._copyTimer = setTimeout(() => {
+    btn.textContent = 'Copy';
+    btn.classList.remove('copied');
+  }, 1800);
+}
+
+// Manual copy (Copy button click). Tries Clipboard API, falls back to execCommand.
+async function copyToClipboard(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    flashCopied(btn);
+    return true;
+  } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+    document.body.removeChild(ta);
+    if (ok) flashCopied(btn);
+    else if (btn) { btn.textContent = 'Copy failed'; setTimeout(() => { btn.textContent = 'Copy'; }, 1800); }
+    return ok;
+  }
 }
 
 async function submit() {
   const raw = $sql.value;
   if (!raw.trim()) return;
 
+  // Queue a clipboard write SYNCHRONOUSLY inside the user-gesture handler.
+  // We pass a Promise<Blob> to ClipboardItem; the browser keeps the user
+  // activation "alive" until the promise resolves, which is essential on
+  // iOS Safari where activation is otherwise consumed by the awaited fetch.
+  let resolveCopyText;
+  const copyTextPromise = new Promise(r => { resolveCopyText = r; });
+
+  let pendingClipboardWrite = null;
+  if (typeof navigator !== 'undefined' && navigator.clipboard && typeof ClipboardItem === 'function') {
+    try {
+      pendingClipboardWrite = navigator.clipboard.write([
+        new ClipboardItem({
+          'text/plain': copyTextPromise.then(t => new Blob([t], { type: 'text/plain' }))
+        })
+      ]);
+    } catch (_) {
+      pendingClipboardWrite = null;
+    }
+  }
+
   setStatus('running', 'Running…');
   $submit.disabled = true;
   $format.disabled = true;
   $result.innerHTML = '';
+  lastCopyBtn = null;
 
+  let copyText = '';
   try {
     const parsed = parseSql(raw);
     const data = await executeQuery(parsed);
-    renderResult(data);
+    copyText = renderResult(data);
   } catch (e) {
-    renderError(e);
+    copyText = renderError(e);
   } finally {
     $submit.disabled = false;
     $format.disabled = false;
     setStatus('ready', 'Ready');
   }
+
+  // Resolve the queued clipboard write with the actual text.
+  resolveCopyText(copyText);
+
+  // Wait for the queued write; fall back to writeText if it failed or wasn't supported.
+  let copied = false;
+  if (pendingClipboardWrite) {
+    try { await pendingClipboardWrite; copied = true; }
+    catch (_) {
+      try { await navigator.clipboard.writeText(copyText); copied = true; } catch (_) {}
+    }
+  } else if (navigator.clipboard) {
+    try { await navigator.clipboard.writeText(copyText); copied = true; } catch (_) {}
+  }
+
+  if (copied) flashCopied(lastCopyBtn);
 }
 
 // ----- Event wiring ----------------------------------------------------------
