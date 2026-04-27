@@ -373,23 +373,24 @@ function buildSelectUrl(parsed) {
 
 // ----- Execution -------------------------------------------------------------
 
-async function executeQuery(parsed) {
-  if (parsed.kind === 'select') return runSelect(parsed);
-  return runRpc(parsed);
+async function executeQuery(parsed, signal) {
+  if (parsed.kind === 'select') return runSelect(parsed, signal);
+  return runRpc(parsed, signal);
 }
 
-async function runSelect(parsed) {
+async function runSelect(parsed, signal) {
   const res = await fetch(buildSelectUrl(parsed), {
     headers: {
       'apikey': SUPABASE_KEY,
       'Authorization': `Bearer ${SUPABASE_KEY}`,
       'Accept': 'application/json'
-    }
+    },
+    signal
   });
   return handleResponse(res);
 }
 
-async function runRpc(parsed) {
+async function runRpc(parsed, signal) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${parsed.function}`, {
     method: 'POST',
     headers: {
@@ -398,7 +399,8 @@ async function runRpc(parsed) {
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
-    body: JSON.stringify(parsed.args || {})
+    body: JSON.stringify(parsed.args || {}),
+    signal
   });
   return handleResponse(res);
 }
@@ -423,7 +425,10 @@ async function handleResponse(res) {
     throw new SqlError(`HTTP ${res.status}: ${data || res.statusText}`);
   }
 
-  return data;
+  // PostgREST normally doesn't set a Warning header, but the spec defines a
+  // warning result shape so we surface one when it does appear (per RFC 7234).
+  const warning = res.headers && res.headers.get ? res.headers.get('Warning') : null;
+  return { data, warning };
 }
 
 // ----- SQL display formatter -------------------------------------------------
@@ -454,44 +459,65 @@ function formatSql(sql) {
   return out;
 }
 
-// ----- Markdown rendering (for clipboard) ------------------------------------
+// ----- Result building (JSON shapes per v1.1 spec §2.2) ---------------------
 
-function toMarkdown(data) {
-  if (Array.isArray(data)) {
-    if (data.length === 0) return 'Query executed, no rows returned.';
-    return rowsToMarkdownTable(data);
+function buildResultJson(data, warning) {
+  if (warning) {
+    return { result: 'warning', warning, rows: Array.isArray(data) ? data : [] };
   }
-  if (data === null || data === undefined) return 'Query executed, no rows returned.';
-  return '```json\n' + JSON.stringify(data, null, 2) + '\n```';
+  if (Array.isArray(data) && data.length === 0) {
+    return { result: 'no_rows', message: 'Query executed, no rows returned' };
+  }
+  if (Array.isArray(data)) {
+    return { result: 'rows', row_count: data.length, rows: data };
+  }
+  if (data === null || data === undefined) {
+    return { result: 'no_rows', message: 'Query executed, no rows returned' };
+  }
+  return { result: 'scalar', value: data };
 }
 
-function rowsToMarkdownTable(rows) {
-  const colSet = new Set();
-  for (const row of rows) for (const k of Object.keys(row)) colSet.add(k);
-  const cols = Array.from(colSet);
-
-  const headerRow = '| ' + cols.join(' | ') + ' |';
-  const sepRow = '| ' + cols.map(() => '---').join(' | ') + ' |';
-  const dataRows = rows.map(row =>
-    '| ' + cols.map(c => formatMarkdownCell(row[c])).join(' | ') + ' |'
-  );
-  return [headerRow, sepRow, ...dataRows].join('\n');
+function buildErrorJson(err) {
+  if (err instanceof ParseError) {
+    return { result: 'parse_error', error: err.message };
+  }
+  // SqlError or other
+  const error = { message: err.message };
+  if (err.code) error.code = err.code;
+  if (err.hint) error.hint = err.hint;
+  if (err.details) error.details = err.details;
+  return { result: 'error', error };
 }
 
-function formatMarkdownCell(v) {
-  if (v === null || v === undefined) return '_null_';
-  let s = (typeof v === 'object') ? '`' + JSON.stringify(v) + '`' : String(v);
-  return s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+// ----- Chunking (v1.1 spec §3) -----------------------------------------------
+
+const CHUNK_SIZE = 14000;
+const CHUNK_WRAPPER = (m, n) =>
+  `=== CHUNK ${m} of ${n} — concatenate all chunks in order, strip these markers, parse as JSON ===`;
+
+// Splits a JSON string into chunks. Returns an array of { content, wrapper, index, total }.
+// Single-chunk results have wrapper=null per spec §3.2.
+function chunkJson(jsonString, chunkSize = CHUNK_SIZE) {
+  if (jsonString.length <= chunkSize) {
+    return [{ content: jsonString, wrapper: null, index: 1, total: 1 }];
+  }
+  const total = Math.ceil(jsonString.length / chunkSize);
+  const chunks = [];
+  for (let i = 0; i < total; i++) {
+    chunks.push({
+      content: jsonString.slice(i * chunkSize, (i + 1) * chunkSize),
+      wrapper: CHUNK_WRAPPER(i + 1, total),
+      index: i + 1,
+      total
+    });
+  }
+  return chunks;
 }
 
-function errorToMarkdown(err) {
-  const lines = ['```'];
-  if (err.code) lines.push(`Code: ${err.code}`);
-  lines.push(`Error: ${err.message}`);
-  if (err.hint) lines.push(`Hint: ${err.hint}`);
-  if (err.details) lines.push(`Details: ${err.details}`);
-  lines.push('```');
-  return lines.join('\n');
+// What goes on the clipboard for a given chunk: wrapper line + content, or just content
+// if it's a single-chunk result (per spec §3.2: "the wrapper is omitted").
+function chunkClipboardText(chunk) {
+  return chunk.wrapper ? `${chunk.wrapper}\n${chunk.content}` : chunk.content;
 }
 
 // =============================================================================
@@ -525,192 +551,225 @@ function escapeHtml(s) {
   }[m]));
 }
 
-function renderTable(rows) {
-  const colSet = new Set();
-  for (const row of rows) for (const k of Object.keys(row)) colSet.add(k);
-  const cols = Array.from(colSet);
-
-  const wrapper = document.createElement('div');
-  wrapper.className = 'table-wrapper';
-
-  const table = document.createElement('table');
-  table.className = 'result-table';
-
-  const thead = document.createElement('thead');
-  const headerRow = document.createElement('tr');
-  for (const c of cols) {
-    const th = document.createElement('th');
-    th.textContent = c;
-    headerRow.appendChild(th);
+function labelForResult(resultJson) {
+  switch (resultJson.result) {
+    case 'rows':        return `${resultJson.row_count} row${resultJson.row_count === 1 ? '' : 's'}`;
+    case 'no_rows':     return 'No rows';
+    case 'scalar':      return 'Scalar';
+    case 'warning':     return 'Warning';
+    case 'error':       return 'Error';
+    case 'parse_error': return 'Parse error';
+    default:            return 'Result';
   }
-  thead.appendChild(headerRow);
-  table.appendChild(thead);
+}
 
-  const tbody = document.createElement('tbody');
-  for (const row of rows) {
-    const tr = document.createElement('tr');
-    for (const c of cols) {
-      const td = document.createElement('td');
-      const v = row[c];
-      if (v === null || v === undefined) {
-        td.innerHTML = '<span class="null">null</span>';
-      } else if (typeof v === 'object') {
-        const code = document.createElement('code');
-        code.textContent = JSON.stringify(v);
-        td.appendChild(code);
-      } else {
-        td.textContent = String(v);
-      }
-      tr.appendChild(td);
+// Lightweight JSON syntax highlighter. Tokenises raw text and wraps tokens in
+// classed spans; non-token gaps are HTML-escaped untouched. Tolerates partial
+// JSON (mid-token chunk slices) — anything that doesn't match a token regex
+// stays as plain escaped text without throwing.
+function highlightJson(text) {
+  const tokenRe = /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
+  let out = '';
+  let last = 0;
+  let m;
+  while ((m = tokenRe.exec(text)) !== null) {
+    if (m.index > last) out += escapeHtml(text.slice(last, m.index));
+    if (m[1]) {
+      const cls = m[2] ? 'json-key' : 'json-string';
+      out += `<span class="${cls}">${escapeHtml(m[1])}</span>`;
+      if (m[2]) out += escapeHtml(m[2]);
+    } else if (m[3]) {
+      out += `<span class="${m[3] === 'null' ? 'json-null' : 'json-bool'}">${m[3]}</span>`;
+    } else if (m[4]) {
+      out += `<span class="json-number">${m[4]}</span>`;
     }
-    tbody.appendChild(tr);
+    last = tokenRe.lastIndex;
   }
-  table.appendChild(tbody);
-  wrapper.appendChild(table);
-  return wrapper;
+  if (last < text.length) out += escapeHtml(text.slice(last));
+  return out;
 }
 
-function renderEmpty() {
-  const div = document.createElement('div');
-  div.className = 'empty-message';
-  div.textContent = 'Query executed, no rows returned.';
-  return div;
-}
+// ----- Result rendering (JSON, with chunking nav for large results) ---------
+//
+// Module-level state for the currently-rendered result so chunk navigation
+// can mutate the view without rebuilding the card.
 
-function renderScalar(data) {
-  const pre = document.createElement('pre');
-  pre.className = 'scalar';
-  pre.textContent = JSON.stringify(data, null, 2);
-  return pre;
-}
-
-// Tracks the most recently rendered Copy button so submit() can flag it
-// as "Copied" once the auto-clipboard write completes.
+let currentChunks = [];
+let currentChunkIndex = 0;
+let currentResultLabel = '';
+let currentIsError = false;
 let lastCopyBtn = null;
 
-function renderResult(data) {
+function renderJsonResult(resultJson, isError) {
+  const fullText = JSON.stringify(resultJson, null, 2);
+  currentChunks = chunkJson(fullText);
+  currentChunkIndex = 0;
+  currentResultLabel = labelForResult(resultJson);
+  currentIsError = !!isError;
+
   $result.innerHTML = '';
-
-  let kind, content, copyText, label;
-  if (Array.isArray(data) && data.length === 0) {
-    kind = 'empty';
-    label = 'No rows';
-    content = renderEmpty();
-    copyText = 'Query executed, no rows returned.';
-  } else if (Array.isArray(data)) {
-    kind = 'rows';
-    label = `${data.length} row${data.length === 1 ? '' : 's'}`;
-    content = renderTable(data);
-    copyText = toMarkdown(data);
-  } else if (data === null || data === undefined) {
-    kind = 'empty';
-    label = 'No result';
-    content = renderEmpty();
-    copyText = 'Query executed, no rows returned.';
-  } else {
-    kind = 'scalar';
-    label = 'Result';
-    content = renderScalar(data);
-    copyText = toMarkdown(data);
-  }
-
   const card = document.createElement('div');
-  card.className = `result-card success ${kind}`;
+  card.className = `result-card ${isError ? 'error' : 'success'}`;
 
+  // Header wrapper holds the indicator+Copy row and (when chunked) a nav row.
   const header = document.createElement('div');
-  header.className = 'result-header';
+  header.className = 'result-header-wrap';
+
+  const headerTop = document.createElement('div');
+  headerTop.className = 'result-header';
+
   const labelEl = document.createElement('span');
   labelEl.className = 'result-label';
-  labelEl.textContent = label;
-  const copyBtn = makeCopyButton(copyText);
-  lastCopyBtn = copyBtn;
-  header.appendChild(labelEl);
-  header.appendChild(copyBtn);
+  labelEl.id = 'result-label';
+  headerTop.appendChild(labelEl);
 
+  const copyCurrentBtn = document.createElement('button');
+  copyCurrentBtn.className = 'copy-btn';
+  copyCurrentBtn.id = 'copy-current-btn';
+  copyCurrentBtn.type = 'button';
+  copyCurrentBtn.textContent = 'Copy';
+  copyCurrentBtn.addEventListener('click', () => {
+    const text = chunkClipboardText(currentChunks[currentChunkIndex]);
+    copyToClipboard(text, copyCurrentBtn);
+  });
+  headerTop.appendChild(copyCurrentBtn);
+  header.appendChild(headerTop);
+
+  // The Copy current button is what auto-copy will flash to "Copied".
+  lastCopyBtn = copyCurrentBtn;
+
+  // Multi-chunk: second header row with prev/next nav and Copy next.
+  if (currentChunks.length > 1) {
+    const navRow = document.createElement('div');
+    navRow.className = 'chunk-nav-row';
+
+    const navLeft = document.createElement('div');
+    navLeft.className = 'chunk-nav-left';
+
+    const prevBtn = document.createElement('button');
+    prevBtn.className = 'chunk-nav-btn';
+    prevBtn.id = 'chunk-prev-btn';
+    prevBtn.type = 'button';
+    prevBtn.textContent = '◀';
+    prevBtn.setAttribute('aria-label', 'Previous chunk');
+    prevBtn.addEventListener('click', () => navigateChunk(-1));
+    navLeft.appendChild(prevBtn);
+
+    const nextBtn = document.createElement('button');
+    nextBtn.className = 'chunk-nav-btn';
+    nextBtn.id = 'chunk-next-btn';
+    nextBtn.type = 'button';
+    nextBtn.textContent = '▶';
+    nextBtn.setAttribute('aria-label', 'Next chunk');
+    nextBtn.addEventListener('click', () => navigateChunk(1));
+    navLeft.appendChild(nextBtn);
+
+    navRow.appendChild(navLeft);
+
+    const copyNextBtn = document.createElement('button');
+    copyNextBtn.className = 'copy-btn copy-next-btn';
+    copyNextBtn.id = 'copy-next-btn';
+    copyNextBtn.type = 'button';
+    copyNextBtn.textContent = 'Copy next';
+    copyNextBtn.addEventListener('click', copyNextChunk);
+    navRow.appendChild(copyNextBtn);
+
+    header.appendChild(navRow);
+  }
+
+  // Body: JSON viewer (syntax-highlighted)
   const body = document.createElement('div');
-  body.className = 'result-body';
-  body.appendChild(content);
+  body.className = 'result-body json-body';
+  const pre = document.createElement('pre');
+  pre.className = 'json-viewer';
+  pre.id = 'json-viewer';
+  body.appendChild(pre);
 
   card.appendChild(header);
   card.appendChild(body);
   $result.appendChild(card);
 
-  return copyText;
+  updateChunkDisplay();
+
+  // Auto-copy text is chunk 1's clipboard form (with wrapper marker if multi).
+  return chunkClipboardText(currentChunks[0]);
 }
 
-function renderError(err) {
+function updateChunkDisplay() {
+  if (currentChunks.length === 0) return;
+  const chunk = currentChunks[currentChunkIndex];
+  const labelEl = document.getElementById('result-label');
+  const viewer = document.getElementById('json-viewer');
+  if (!labelEl || !viewer) return;
+
+  if (currentChunks.length > 1) {
+    labelEl.textContent = `Chunk ${chunk.index} of ${chunk.total}`;
+    labelEl.classList.add('chunk-indicator');
+
+    const prevBtn = document.getElementById('chunk-prev-btn');
+    const nextBtn = document.getElementById('chunk-next-btn');
+    const copyNextBtn = document.getElementById('copy-next-btn');
+    if (prevBtn) prevBtn.disabled = (currentChunkIndex === 0);
+    if (nextBtn) nextBtn.disabled = (currentChunkIndex === currentChunks.length - 1);
+    if (copyNextBtn) copyNextBtn.disabled = (currentChunkIndex === currentChunks.length - 1);
+  } else {
+    labelEl.textContent = currentResultLabel;
+    labelEl.classList.remove('chunk-indicator');
+  }
+
+  viewer.innerHTML = highlightJson(chunk.content);
+}
+
+function navigateChunk(delta) {
+  const next = currentChunkIndex + delta;
+  if (next < 0 || next >= currentChunks.length) return;
+  currentChunkIndex = next;
+  updateChunkDisplay();
+}
+
+async function copyNextChunk() {
+  if (currentChunkIndex >= currentChunks.length - 1) return;
+  currentChunkIndex++;
+  updateChunkDisplay();
+  const btn = document.getElementById('copy-next-btn');
+  const text = chunkClipboardText(currentChunks[currentChunkIndex]);
+  await copyToClipboard(text, btn);
+}
+
+function clearAll() {
+  if (currentAbort) {
+    try { currentAbort.abort(); } catch (_) {}
+    currentAbort = null;
+  }
+  $sql.value = '';
   $result.innerHTML = '';
-  const copyText = errorToMarkdown(err);
-
-  const card = document.createElement('div');
-  card.className = 'result-card error';
-
-  const header = document.createElement('div');
-  header.className = 'result-header';
-  const labelWrap = document.createElement('span');
-  labelWrap.className = 'result-label';
-  labelWrap.textContent = 'Error';
-  if (err.code) {
-    const code = document.createElement('span');
-    code.className = 'error-code';
-    code.textContent = err.code;
-    labelWrap.appendChild(code);
-  }
-  const copyBtn = makeCopyButton(copyText);
-  lastCopyBtn = copyBtn;
-  header.appendChild(labelWrap);
-  header.appendChild(copyBtn);
-
-  const body = document.createElement('div');
-  body.className = 'result-body error-body';
-
-  const msg = document.createElement('div');
-  msg.className = 'error-message';
-  msg.textContent = err.message;
-  body.appendChild(msg);
-
-  if (err.hint) {
-    const hint = document.createElement('div');
-    hint.className = 'error-meta';
-    hint.innerHTML = `<span class="meta-label">Hint</span><span class="meta-value">${escapeHtml(err.hint)}</span>`;
-    body.appendChild(hint);
-  }
-  if (err.details) {
-    const details = document.createElement('div');
-    details.className = 'error-meta';
-    details.innerHTML = `<span class="meta-label">Details</span><span class="meta-value">${escapeHtml(err.details)}</span>`;
-    body.appendChild(details);
-  }
-
-  card.appendChild(header);
-  card.appendChild(body);
-  $result.appendChild(card);
-
-  return copyText;
+  currentChunks = [];
+  currentChunkIndex = 0;
+  currentResultLabel = '';
+  currentIsError = false;
+  lastCopyBtn = null;
+  $submit.disabled = false;
+  $format.disabled = false;
+  setStatus('ready', 'Ready');
+  autoResize();
 }
 
-function makeCopyButton(text) {
-  const btn = document.createElement('button');
-  btn.className = 'copy-btn';
-  btn.type = 'button';
-  btn.textContent = 'Copy';
-  btn.addEventListener('click', () => copyToClipboard(text, btn));
-  return btn;
-}
-
-// Visual "Copied" state on a button, reverting after a beat.
+// Visual "Copied" state on a button, reverting to the button's original label
+// after a beat. Original label captured on first flash so we can restore it
+// for buttons whose default label isn't "Copy" (e.g. "Copy next").
 function flashCopied(btn, label = 'Copied') {
   if (!btn) return;
+  if (typeof btn._origLabel !== 'string') btn._origLabel = btn.textContent;
   btn.textContent = label;
   btn.classList.add('copied');
   clearTimeout(btn._copyTimer);
   btn._copyTimer = setTimeout(() => {
-    btn.textContent = 'Copy';
+    btn.textContent = btn._origLabel;
     btn.classList.remove('copied');
   }, 1800);
 }
 
-// Manual copy (Copy button click). Tries Clipboard API, falls back to execCommand.
+// Manual copy (any Copy button click). Clipboard API first, execCommand fallback.
 async function copyToClipboard(text, btn) {
   try {
     await navigator.clipboard.writeText(text);
@@ -727,21 +786,38 @@ async function copyToClipboard(text, btn) {
     try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
     document.body.removeChild(ta);
     if (ok) flashCopied(btn);
-    else if (btn) { btn.textContent = 'Copy failed'; setTimeout(() => { btn.textContent = 'Copy'; }, 1800); }
+    else if (btn) {
+      const orig = btn._origLabel || btn.textContent;
+      btn.textContent = 'Copy failed';
+      setTimeout(() => { btn.textContent = orig; }, 1800);
+    }
     return ok;
   }
 }
+
+// AbortController for the in-flight query. Submit cancels any prior fetch
+// before starting a new one, and Clear cancels without starting a new one.
+let currentAbort = null;
 
 async function submit() {
   const raw = $sql.value;
   if (!raw.trim()) return;
 
-  // Queue a clipboard write SYNCHRONOUSLY inside the user-gesture handler.
-  // We pass a Promise<Blob> to ClipboardItem; the browser keeps the user
-  // activation "alive" until the promise resolves, which is essential on
-  // iOS Safari where activation is otherwise consumed by the awaited fetch.
-  let resolveCopyText;
-  const copyTextPromise = new Promise(r => { resolveCopyText = r; });
+  // Cancel any prior in-flight query before kicking off a new one.
+  if (currentAbort) {
+    try { currentAbort.abort(); } catch (_) {}
+  }
+  currentAbort = new AbortController();
+  const signal = currentAbort.signal;
+
+  // Queue clipboard write SYNCHRONOUSLY inside the user-gesture handler.
+  // ClipboardItem with a Promise<Blob> preserves user activation across the
+  // awaited fetch — necessary for iOS Safari, helpful elsewhere.
+  let resolveCopyText, rejectCopyText;
+  const copyTextPromise = new Promise((res, rej) => {
+    resolveCopyText = res;
+    rejectCopyText = rej;
+  });
 
   let pendingClipboardWrite = null;
   if (typeof navigator !== 'undefined' && navigator.clipboard && typeof ClipboardItem === 'function') {
@@ -761,24 +837,46 @@ async function submit() {
   $format.disabled = true;
   $result.innerHTML = '';
   lastCopyBtn = null;
+  currentChunks = [];
+  currentChunkIndex = 0;
 
-  let copyText = '';
+  let resultJson = null;
+  let isError = false;
+  let bailed = false;
+
   try {
     const parsed = parseSql(raw);
-    const data = await executeQuery(parsed);
-    copyText = renderResult(data);
+    const { data, warning } = await executeQuery(parsed, signal);
+    resultJson = buildResultJson(data, warning);
   } catch (e) {
-    copyText = renderError(e);
-  } finally {
-    $submit.disabled = false;
-    $format.disabled = false;
-    setStatus('ready', 'Ready');
+    if (e && e.name === 'AbortError') {
+      bailed = true;
+    } else {
+      isError = true;
+      resultJson = buildErrorJson(e);
+    }
   }
 
-  // Resolve the queued clipboard write with the actual text.
+  $submit.disabled = false;
+  $format.disabled = false;
+  setStatus('ready', 'Ready');
+  currentAbort = null;
+
+  if (bailed) {
+    // Clear was pressed mid-query. Reject the queued clipboard promise so
+    // the browser doesn't write anything — preserves whatever Paul had
+    // copied previously, per spec §4 ("does not affect clipboard").
+    rejectCopyText(new Error('cancelled'));
+    if (pendingClipboardWrite) {
+      try { await pendingClipboardWrite; } catch (_) {}
+    }
+    return;
+  }
+
+  const copyText = renderJsonResult(resultJson, isError);
   resolveCopyText(copyText);
 
-  // Wait for the queued write; fall back to writeText if it failed or wasn't supported.
+  // Wait for queued write; fall back to writeText if it failed or wasn't supported.
   let copied = false;
   if (pendingClipboardWrite) {
     try { await pendingClipboardWrite; copied = true; }
@@ -819,6 +917,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   $submit.addEventListener('click', submit);
 
+  const $clear = document.getElementById('clear-btn');
+  if ($clear) $clear.addEventListener('click', clearAll);
+
   setStatus('ready', 'Ready');
   autoResize();
 });
@@ -828,8 +929,9 @@ document.addEventListener('DOMContentLoaded', () => {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     parseSql, parseRpcArgs, parseValue, parseWhere, splitTopLevel,
-    splitTopLevelKeyword, formatSql, toMarkdown, rowsToMarkdownTable,
-    errorToMarkdown, buildSelectUrl, ParseError, SqlError,
+    splitTopLevelKeyword, formatSql, buildSelectUrl,
+    buildResultJson, buildErrorJson, chunkJson, chunkClipboardText,
+    CHUNK_SIZE, ParseError, SqlError,
     SUPABASE_URL, SUPABASE_KEY
   };
 }
