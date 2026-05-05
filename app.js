@@ -1,13 +1,16 @@
 // =============================================================================
-// SQL Query Tool
-// Translates a small SQL subset into Supabase PostgREST calls.
+// SQL Query Tool — v1.2 wire
+// All submissions route through public.submit_sql(p_envelope jsonb) on the
+// main Supabase project. The SP handles parsing, translation, execution, and
+// audit-as-side-effect-of-execution per the architectural baseline §4.1.
 //
-// Supported:
-//   • SELECT cols FROM table [WHERE conditions] [ORDER BY cols] [LIMIT n]
-//   • SELECT function_name(p_arg := value, ...)
+// Frontend responsibility ends at envelope construction:
+//   { sql: <raw text>, context: null }
 //
-// Not supported (out of scope per spec):
-//   • DDL, multi-statement scripts, joins, subqueries, raw arbitrary SQL.
+// The SP's return shape passes through to the existing JSON renderer; we do
+// not parse SQL on the client for the wire path. parseSql() and helpers below
+// are retained for potential future client-side validation but are NOT on
+// the wire path in v1.2 — to be cleaned up or repurposed in a later sprint.
 // =============================================================================
 
 // ----- Configuration ---------------------------------------------------------
@@ -373,25 +376,15 @@ function buildSelectUrl(parsed) {
 
 // ----- Execution -------------------------------------------------------------
 
-async function executeQuery(parsed, signal) {
-  if (parsed.kind === 'select') return runSelect(parsed, signal);
-  return runRpc(parsed, signal);
-}
-
-async function runSelect(parsed, signal) {
-  const res = await fetch(buildSelectUrl(parsed), {
-    headers: {
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Accept': 'application/json'
-    },
-    signal
-  });
-  return handleResponse(res);
-}
-
-async function runRpc(parsed, signal) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${parsed.function}`, {
+async function runEnvelope(rawSql, signal) {
+  // v1.2: build envelope per architectural baseline §4.4 and POST to submit_sql.
+  // The SP owns parsing, translation, execution, and audit. Frontend does not
+  // pre-parse the SQL — whatever the user types goes into the envelope verbatim.
+  const envelope = {
+    sql: rawSql,
+    context: null
+  };
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/submit_sql`, {
     method: 'POST',
     headers: {
       'apikey': SUPABASE_KEY,
@@ -399,7 +392,7 @@ async function runRpc(parsed, signal) {
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
-    body: JSON.stringify(parsed.args || {}),
+    body: JSON.stringify({ p_envelope: envelope }),
     signal
   });
   return handleResponse(res);
@@ -845,8 +838,9 @@ async function submit() {
   let bailed = false;
 
   try {
-    const parsed = parseSql(raw);
-    const { data, warning } = await executeQuery(parsed, signal);
+    // v1.2 wire: skip client-side parsing. Send raw SQL to submit_sql, which
+    // owns parsing/translation/execution/audit per architectural baseline §4.1.
+    const { data, warning } = await runEnvelope(raw, signal);
     resultJson = buildResultJson(data, warning);
   } catch (e) {
     if (e && e.name === 'AbortError') {
