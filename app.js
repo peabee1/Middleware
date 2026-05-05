@@ -527,11 +527,31 @@ const $format = $('format-btn');
 const $submit = $('submit-btn');
 const $status = $('status');
 const $result = $('result');
+const $undoBar = $('paste-undo-bar');
+const $undoBtn = $('paste-undo-btn');
 
-function autoResize() {
-  $sql.style.height = 'auto';
-  $sql.style.height = Math.max(140, Math.min($sql.scrollHeight + 2, 600)) + 'px';
-}
+// ---- Smart-paste state (SPR-031 UX bundle) --------------------------------
+//
+// lastSubmittedSql:    SQL most recently sent to submit_sql (any outcome).
+//                      Used as the gate: auto-paste only fires when current
+//                      input contents === lastSubmittedSql, i.e. the input
+//                      has already been "spent" on a query and overwriting
+//                      it doesn't destroy unsubmitted edits.
+//
+// lastCopiedFromResult: text most recently placed on the clipboard by this
+//                      app's result area (manual Copy buttons, or auto-copy
+//                      after a query). Used to suppress auto-paste when the
+//                      user's clipboard is just the result they copied —
+//                      otherwise we'd loop the result back into the input.
+//
+// preAutoPasteValue:   the input's value immediately before the most recent
+//                      auto-paste. Restored by the Undo button or wiped
+//                      when the undo bar dismisses.
+
+let lastSubmittedSql = '';
+let lastCopiedFromResult = '';
+let preAutoPasteValue = null;
+let undoTimer = null;
 
 function setStatus(state, text) {
   $status.dataset.state = state;
@@ -702,9 +722,19 @@ function updateChunkDisplay() {
     const prevBtn = document.getElementById('chunk-prev-btn');
     const nextBtn = document.getElementById('chunk-next-btn');
     const copyNextBtn = document.getElementById('copy-next-btn');
+    const moreChunks = currentChunkIndex < currentChunks.length - 1;
+
     if (prevBtn) prevBtn.disabled = (currentChunkIndex === 0);
-    if (nextBtn) nextBtn.disabled = (currentChunkIndex === currentChunks.length - 1);
-    if (copyNextBtn) copyNextBtn.disabled = (currentChunkIndex === currentChunks.length - 1);
+    if (nextBtn) {
+      nextBtn.disabled = !moreChunks;
+      // SPR-031 change 3: pulse the next button when more chunks remain so
+      // users notice there's content beyond the current view.
+      nextBtn.classList.toggle('pulse', moreChunks);
+    }
+    if (copyNextBtn) {
+      copyNextBtn.disabled = !moreChunks;
+      copyNextBtn.classList.toggle('pulse', moreChunks);
+    }
   } else {
     labelEl.textContent = currentResultLabel;
     labelEl.classList.remove('chunk-indicator');
@@ -744,7 +774,10 @@ function clearAll() {
   $submit.disabled = false;
   $format.disabled = false;
   setStatus('ready', 'Ready');
-  autoResize();
+  hideUndoBar();
+  // Clear is treated as a "fresh slate" — empty input is a valid auto-paste
+  // target, so reset lastSubmittedSql to the empty string to match.
+  lastSubmittedSql = '';
 }
 
 // Visual "Copied" state on a button, reverting to the button's original label
@@ -764,6 +797,9 @@ function flashCopied(btn, label = 'Copied') {
 
 // Manual copy (any Copy button click). Clipboard API first, execCommand fallback.
 async function copyToClipboard(text, btn) {
+  // SPR-031 change 2: track last-copied-from-result so smart-paste can suppress
+  // looping the user's just-copied result back into the input.
+  lastCopiedFromResult = text;
   try {
     await navigator.clipboard.writeText(text);
     flashCopied(btn);
@@ -788,6 +824,52 @@ async function copyToClipboard(text, btn) {
   }
 }
 
+// ---- Smart auto-paste with undo (SPR-031 change 2) ------------------------
+
+// Show the undo bar; auto-hide after 5s. clearTimeout in case rapid focus
+// sequences arrive — only the most recent 5s window matters.
+function showUndoBar() {
+  if (!$undoBar) return;
+  $undoBar.hidden = false;
+  if (undoTimer) clearTimeout(undoTimer);
+  undoTimer = setTimeout(hideUndoBar, 5000);
+}
+
+function hideUndoBar() {
+  if (!$undoBar) return;
+  $undoBar.hidden = true;
+  if (undoTimer) { clearTimeout(undoTimer); undoTimer = null; }
+  preAutoPasteValue = null;
+}
+
+// Fires on textarea focus (covers click and tab-to). Reads clipboard, decides
+// whether to overwrite. Decision matrix per the ticket:
+//   input === lastSubmittedSql  AND clip !== lastCopiedFromResult → paste + undo
+//   input !== lastSubmittedSql  → no-op (protect in-progress edits)
+//   clip === lastCopiedFromResult → no-op (don't loop result back)
+async function maybeAutoPaste() {
+  const currentVal = $sql.value;
+
+  // Protect in-progress unsubmitted edits.
+  if (currentVal !== lastSubmittedSql) return;
+
+  // Clipboard API gate. Some browsers/contexts won't expose readText.
+  if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') return;
+
+  let clip;
+  try { clip = await navigator.clipboard.readText(); }
+  catch (_) { return; }
+
+  if (!clip) return;
+  if (clip === lastCopiedFromResult) return; // suppress: don't loop result back
+  if (clip === currentVal) return;           // already identical — pointless paste
+
+  // Commit the paste; remember the prior value for undo.
+  preAutoPasteValue = currentVal;
+  $sql.value = clip;
+  showUndoBar();
+}
+
 // AbortController for the in-flight query. Submit cancels any prior fetch
 // before starting a new one, and Clear cancels without starting a new one.
 let currentAbort = null;
@@ -795,6 +877,9 @@ let currentAbort = null;
 async function submit() {
   const raw = $sql.value;
   if (!raw.trim()) return;
+
+  // Submit dismisses the undo bar — Paul accepted the paste by acting on it.
+  hideUndoBar();
 
   // Cancel any prior in-flight query before kicking off a new one.
   if (currentAbort) {
@@ -867,8 +952,16 @@ async function submit() {
     return;
   }
 
+  // SPR-031 change 2: mark this SQL as "spent" — the input now matches a
+  // submitted query, so future focus events can safely auto-paste over it.
+  lastSubmittedSql = raw;
+
   const copyText = renderJsonResult(resultJson, isError);
   resolveCopyText(copyText);
+
+  // Track the auto-copy as a result-area copy too, so smart-paste suppresses
+  // looping it back if the user clicks the input next.
+  lastCopiedFromResult = copyText;
 
   // Wait for queued write; fall back to writeText if it failed or wasn't supported.
   let copied = false;
@@ -887,8 +980,6 @@ async function submit() {
 // ----- Event wiring ----------------------------------------------------------
 
 document.addEventListener('DOMContentLoaded', () => {
-  $sql.addEventListener('input', autoResize);
-
   $sql.addEventListener('keydown', (e) => {
     if (e.key === 'Tab') {
       e.preventDefault();
@@ -896,7 +987,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const end = $sql.selectionEnd;
       $sql.value = $sql.value.slice(0, start) + '  ' + $sql.value.slice(end);
       $sql.selectionStart = $sql.selectionEnd = start + 2;
-      autoResize();
     }
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault();
@@ -904,9 +994,21 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  // SPR-031 change 2: smart auto-paste on focus.
+  $sql.addEventListener('focus', maybeAutoPaste);
+
+  if ($undoBtn) {
+    $undoBtn.addEventListener('click', () => {
+      if (preAutoPasteValue !== null) {
+        $sql.value = preAutoPasteValue;
+      }
+      hideUndoBar();
+      $sql.focus();
+    });
+  }
+
   $format.addEventListener('click', () => {
     $sql.value = formatSql($sql.value);
-    autoResize();
   });
 
   $submit.addEventListener('click', submit);
@@ -915,7 +1017,6 @@ document.addEventListener('DOMContentLoaded', () => {
   if ($clear) $clear.addEventListener('click', clearAll);
 
   setStatus('ready', 'Ready');
-  autoResize();
 });
 } // end initUI
 
