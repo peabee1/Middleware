@@ -640,151 +640,8 @@ function chunkClipboardText(chunk) {
     }
   }
 
-  window.CopyFAB = { attach, onPaste, onSubmit, onComplete, onResultsCleared hParams.set('select', cols);
-
-  if (parsed.where) {
-    for (const [col, op, val] of parseWhere(parsed.where)) {
-      url.searchParams.append(col, `${op}.${val}`);
-    }
-  }
-
-  if (parsed.orderBy) {
-    const orders = parsed.orderBy.split(',').map(s => {
-      const parts = s.trim().split(/\s+/);
-      const col = parts[0];
-      const dir = (parts[1] || 'asc').toLowerCase();
-      if (dir !== 'asc' && dir !== 'desc') throw new ParseError(`Invalid order direction: ${dir}`);
-      return `${col}.${dir}`;
-    });
-    url.searchParams.set('order', orders.join(','));
-  }
-
-  if (parsed.limit) url.searchParams.set('limit', parsed.limit);
-
-  return url.toString();
-}
-
-async function runEnvelope(rawSql, signal) {
-  const envelope = { sql: rawSql, context: null };
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/submit_sql`, {
-    method: 'POST',
-    headers: {
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: JSON.stringify({ p_envelope: envelope }),
-    signal
-  });
-  return handleResponse(res);
-}
-
-async function handleResponse(res) {
-  const text = await res.text();
-  let data = null;
-  if (text) {
-    try { data = JSON.parse(text); }
-    catch (e) { data = text; }
-  }
-
-  if (!res.ok) {
-    if (data && typeof data === 'object') {
-      throw new SqlError(
-        data.message || data.msg || `HTTP ${res.status}`,
-        data.code,
-        data.hint,
-        data.details
-      );
-    }
-    throw new SqlError(`HTTP ${res.status}: ${data || res.statusText}`);
-  }
-
-  const warning = res.headers && res.headers.get ? res.headers.get('Warning') : null;
-  return { data, warning };
-}
-
-function formatSql(sql) {
-  let out = sql.trim().replace(/;\s*$/, '');
-
-  const majorKeywords = [
-    'FROM', 'WHERE', 'ORDER\\s+BY', 'GROUP\\s+BY', 'HAVING', 'LIMIT', 'OFFSET',
-    'JOIN', 'LEFT\\s+JOIN', 'RIGHT\\s+JOIN', 'INNER\\s+JOIN', 'OUTER\\s+JOIN', 'CROSS\\s+JOIN',
-    'UNION\\s+ALL', 'UNION', 'INTERSECT', 'EXCEPT'
-  ];
-  for (const kw of majorKeywords) {
-    out = out.replace(new RegExp(`\\s+(${kw})\\s+`, 'gi'), '\n$1 ');
-  }
-
-  out = out.replace(/\s+(AND|OR)\s+/gi, '\n  $1 ');
-
-  out = out.replace(/^SELECT\s+([\s\S]+?)(\nFROM|\s+FROM)/i, (match, cols, rest) => {
-    const colList = cols.split(',').map(c => c.trim()).filter(Boolean);
-    if (colList.length > 3 || cols.length > 60) {
-      const fromPart = rest.trim().startsWith('FROM') ? '\nFROM' : rest;
-      return 'SELECT\n  ' + colList.join(',\n  ') + (fromPart.startsWith('\n') ? fromPart : '\n' + fromPart);
-    }
-    return match;
-  });
-
-  return out;
-}
-
-function buildResultJson(data, warning) {
-  if (warning) {
-    return { result: 'warning', warning, rows: Array.isArray(data) ? data : [] };
-  }
-  if (Array.isArray(data) && data.length === 0) {
-    return { result: 'no_rows', message: 'Query executed, no rows returned' };
-  }
-  if (Array.isArray(data)) {
-    return { result: 'rows', row_count: data.length, rows: data };
-  }
-  if (data === null || data === undefined) {
-    return { result: 'no_rows', message: 'Query executed, no rows returned' };
-  }
-  return { result: 'scalar', value: data };
-}
-
-function buildErrorJson(err) {
-  if (err instanceof ParseError) {
-    return { result: 'parse_error', error: err.message };
-  }
-  const error = { message: err.message };
-  if (err.code) error.code = err.code;
-  if (err.hint) error.hint = err.hint;
-  if (err.details) error.details = err.details;
-  return { result: 'error', error };
-}
-
-const CHUNK_SIZE = 14000;
-const CHUNK_WRAPPER = (m, n) =>
-  `=== CHUNK ${m} of ${n} — concatenate all chunks in order, strip these markers, parse as JSON ===`;
-
-function chunkJson(jsonString, chunkSize = CHUNK_SIZE) {
-  if (jsonString.length <= chunkSize) {
-    return [{ content: jsonString, wrapper: null, index: 1, total: 1 }];
-  }
-  const total = Math.ceil(jsonString.length / chunkSize);
-  const chunks = [];
-  for (let i = 0; i < total; i++) {
-    chunks.push({
-      content: jsonString.slice(i * chunkSize, (i + 1) * chunkSize),
-      wrapper: CHUNK_WRAPPER(i + 1, total),
-      index: i + 1,
-      total
-    });
-  }
-  return chunks;
-}
-
-function chunkClipboardText(chunk) {
-  return chunk.wrapper ? `${chunk.wrapper}\n${chunk.content}` : chunk.content;
-}
-
-// =============================================================================
-// UI
-// =============================================================================
+  window.CopyFAB = { attach, onPaste, onSubmit, onComplete, onResultsCleared };
+})();
 
 if (typeof document !== 'undefined') initUI();
 
@@ -1023,6 +880,8 @@ function clearAll() {
   setStatus('ready', 'Ready');
   hideUndoBar();
   lastSubmittedSql = '';
+  // Reset Copy FAB to hidden — clipboard no longer reflects "the latest".
+  if (window.CopyFAB) window.CopyFAB.onResultsCleared();
 }
 
 function flashCopied(btn, label = 'Copied') {
@@ -1103,6 +962,9 @@ async function maybeAutoPaste() {
   preAutoPasteValue = currentVal;
   $sql.value = clip;
   showUndoBar();
+  // Auto-paste replaced the textarea content — input is now stale relative
+  // to the latest run. Reflect that on the Copy FAB.
+  if (window.CopyFAB) window.CopyFAB.onPaste();
 }
 
 function handleSqlBlur() {
@@ -1174,6 +1036,9 @@ async function submit() {
   if (!raw.trim()) return;
 
   hideUndoBar();
+
+  // Notify Copy FAB that a run has started (amber + pulse).
+  if (window.CopyFAB) window.CopyFAB.onSubmit();
 
   if (currentAbort) {
     try { currentAbort.abort(); } catch (_) {}
@@ -1257,6 +1122,10 @@ async function submit() {
   }
 
   if (copied) flashCopied(lastCopyBtn);
+
+  // Notify Copy FAB of run completion (green flash -> idle on success;
+  // copy-failed amber+pulse if the auto-copy didn't reach the clipboard).
+  if (window.CopyFAB) window.CopyFAB.onComplete(copied);
 }
 
 // ----- Event wiring ---------------------------------------------------------
@@ -1310,6 +1179,37 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const $clear = document.getElementById('clear-btn');
   if ($clear) $clear.addEventListener('click', clearAll);
+
+  // ---- Copy FAB wiring -----------------------------------------------------
+  // Attach once the DOM is ready. The FAB delegates clipboard writes back to
+  // copyToClipboard so the writeText + execCommand fallback chain is reused.
+  // getResultsText returns the current chunk's clipboard form so recopy and
+  // stale-copy reflect what's currently visible (chunk-aware).
+  if (window.CopyFAB) {
+    window.CopyFAB.attach({
+      getResultsText: () => {
+        if (currentChunks.length === 0) return '';
+        return chunkClipboardText(currentChunks[currentChunkIndex]);
+      },
+      copyText: async (text) => {
+        // Reuse the existing fallback chain. Pass null for btn so the
+        // in-result Copy button isn't double-flashed; the FAB drives its
+        // own flash via state transitions.
+        return copyToClipboard(text, null);
+      },
+    });
+  }
+
+  // Paste / typed-input detection. Spec is paste-triggered, but Paul's mobile
+  // glide-typing doesn't reliably fire `paste`, so any input change after
+  // the first successful run flips the FAB to stale. The FAB internally
+  // ignores onPaste calls before the first run.
+  const notifyFabPaste = () => {
+    if (window.CopyFAB) window.CopyFAB.onPaste();
+  };
+  $sql.addEventListener('paste',          () => setTimeout(notifyFabPaste, 0));
+  $sql.addEventListener('input',          notifyFabPaste);
+  $sql.addEventListener('compositionend', notifyFabPaste);
 
   setStatus('ready', 'Ready');
 });
