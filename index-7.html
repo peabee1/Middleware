@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#0e0e0d">
+<title>SQL Query Tool</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main class="app">
+<header class="app-header">
+<div class="brand">
+<span class="brand-mark">SQL</span>
+<span class="brand-sub">query tool</span>
+</div>
+<div class="endpoint" title="Supabase project">lkjskaygaijyelfqwoln</div>
+</header>
+<section class="input-section">
+<div class="input-wrap">
+<textarea
+id="sql-input"
+spellcheck="false"
+autocomplete="off"
+autocorrect="off"
+autocapitalize="off"
+placeholder="SELECT * FROM tickets WHERE status = 'OPEN' LIMIT 10"
+></textarea>
+<div
+id="input-resize-handle"
+class="input-resize-handle"
+role="separator"
+aria-orientation="horizontal"
+aria-label="Drag to resize input"
+tabindex="0"
+></div>
+</div>
+<div id="paste-undo-bar" class="paste-undo-bar" hidden>
+<span class="paste-undo-msg">Pasted from clipboard</span>
+<button id="paste-undo-btn" type="button" class="paste-undo-btn">Undo</button>
+</div>
+<div class="actions">
+<button id="format-btn" type="button" class="btn btn-secondary">Format</button>
+</div>
+<div class="status-row">
+<div id="status" class="status" data-state="ready">Ready</div>
+<button id="clear-btn" type="button" class="clear-btn" aria-label="Clear input and result">Clear</button>
+</div>
+</section>
+<section id="result" class="result-section" aria-live="polite"></section>
+<footer class="app-footer">
+<span class="hint">Cmd/Ctrl + Enter to submit · Tab to indent</span>
+</footer>
+</main>
+<button id="submit-btn" type="button" class="submit-fab" aria-label="Submit query">
+<span class="btn-label">Submit</span>
+<span class="btn-spinner" aria-hidden="true"></span>
+</button>
+<!-- Copy FAB — clipboard-state mirror, anchored at runtime below #submit-btn.
+     Styling and lifecycle live in app.css and app.js (Copy FAB section). -->
+<button id="copy-fab" class="copy-fab" data-state="hidden" type="button" aria-live="polite">
+<span id="copy-fab-label">Copy</span>
+</button>
+<script src="app.js" defer></script>
+</body>
+</html>
