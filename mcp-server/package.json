@@ -1,0 +1,30 @@
+{
+  "name": "middleware-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server bridging Claude.ai chats and Paul's Supabase substrate. Part of EPIC-2 Middleware-MVP per DOC-REQ-SPR050-001.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "mcp-handler": "^1.0.0",
+    "next": "^15.0.0",
+    "postgres": "^3.4.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
