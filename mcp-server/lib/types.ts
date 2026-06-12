@@ -26,11 +26,20 @@ export type QueryStatus = 'PENDING' | 'EXECUTED' | 'FAILED' | 'CONSUMED';
 
 export interface PendingQueryRow {
   query_id: string;
-  sql_text: string;
   status: QueryStatus;
   result_payload?: unknown;
   executed_at?: string;
+  failure_reason?: string | null;
+  source_turn_id?: string;
+  // Full shape (lean=false):
+  chat_id?: string;
+  sql_text?: string;
+  detected_at?: string;
+  consumed_at?: string | null;
   submit_sql_audit_id?: string;
+  // Lean shape (lean=true, default):
+  sql_preview?: string;
+  sql_text_len?: number;
 }
 
 export type GetQueryResultResponse =

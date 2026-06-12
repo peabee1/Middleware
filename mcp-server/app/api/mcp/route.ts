@@ -88,11 +88,24 @@ const handler = createMcpHandler(
     // ---- §4.3 get_query_result ----
     server.tool(
       'get_query_result',
-      'Retrieves results of SQL queries Paul has executed via the MVP UI. Returns executed rows for this chat; on mark_consumed=true (default) flips them to CONSUMED so they are not returned again.',
+      'Retrieves results of SQL queries Paul has executed via the MVP UI. Returns executed rows for this chat; on mark_consumed=true (default) flips them to CONSUMED so they are not returned again. Pass query_id to fetch one specific query result instead of all unconsumed rows.',
       {
         chat_id: z.string(),
         include_pending: z.boolean().optional().default(false),
         mark_consumed: z.boolean().optional().default(true),
+        query_id: z
+          .string()
+          .optional()
+          .describe(
+            'Precision fetch: return only this query (e.g. QRY-CHT-067-0003), ignoring the status filter. Omit to return all unconsumed executed/failed rows for the chat.'
+          ),
+        lean: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe(
+            'Lean payload (default true): compact rows with sql_preview and result_payload, omitting full sql_text and audit fields. Set false for the full row shape.'
+          ),
       },
       async (params) => {
         try {
