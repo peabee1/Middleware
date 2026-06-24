@@ -118,12 +118,9 @@ function resolveFields(): ConnFields {
   return parseConnectionString(DATABASE_URL);
 }
 
-function getClient(): SqlClient {
-  if (globalThis.__sql) return globalThis.__sql;
-
+function buildClient(): SqlClient {
   const { host, port, username, password, database } = resolveFields();
-
-  const client = postgres({
+  return postgres({
     host,
     port,
     username,
@@ -135,20 +132,66 @@ function getClient(): SqlClient {
     connect_timeout: 10,
     prepare: false,
   });
+}
 
-  globalThis.__sql = client;
-  return client;
+/**
+ * MT-627: cached client validation.
+ *
+ * porsager/postgres constructs the client eagerly at call time but does not
+ * connect until the first query. On a warm Vercel instance the cached client
+ * on globalThis.__sql may carry stale or invalid credentials from a prior cold
+ * start — it will not fail until a query is actually issued, at which point
+ * every subsequent request in the warm window also fails.
+ *
+ * Fix: before returning a cached client, probe it with `SELECT 1`. If the probe
+ * throws (auth failure, connection refused, timeout) we discard the bad client,
+ * build a fresh one, and return that instead. The probe adds ~1 RTT on the first
+ * request of each warm window but prevents a bad client from persisting.
+ */
+async function validateClient(client: SqlClient): Promise<boolean> {
+  try {
+    await client`SELECT 1`;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getClient(): SqlClient {
+  if (!globalThis.__sql) {
+    globalThis.__sql = buildClient();
+  }
+  return globalThis.__sql;
+}
+
+/**
+ * Returns a validated client, rebuilding if the cached client fails a probe.
+ * Call this from query sites instead of getClient() directly when credential
+ * rotation or bad-start persistence is a concern.
+ */
+export async function getValidatedClient(): Promise<SqlClient> {
+  const client = getClient();
+  if (await validateClient(client)) return client;
+  // Probe failed — discard and rebuild.
+  globalThis.__sql = buildClient();
+  return globalThis.__sql;
 }
 
 /**
  * Lazy proxy preserving the `sql`...`` tagged-template call sites in lib/tools/*.
  * The real postgres client is constructed on first invocation (request time),
  * not at module import, so `next build` can collect page data without config.
+ *
+ * MT-627: the apply trap is async so it can validate (and if necessary rebuild)
+ * the cached client before delegating. Since every postgres tagged-template call
+ * returns a Promise, callers are already awaiting — the async trap is transparent.
  */
 export const sql = new Proxy(function () {} as unknown as SqlClient, {
   apply(_target, _thisArg, argArray: unknown[]) {
-    const client = getClient() as unknown as (...a: unknown[]) => unknown;
-    return client(...argArray);
+    return (async () => {
+      const client = await getValidatedClient() as unknown as (...a: unknown[]) => unknown;
+      return client(...argArray);
+    })();
   },
   get(_target, prop) {
     const client = getClient() as unknown as Record<PropertyKey, unknown>;
