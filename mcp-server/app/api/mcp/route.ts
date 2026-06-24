@@ -3,6 +3,7 @@ import { createMcpHandler } from 'mcp-handler';
 import { recordUserTurn } from '@/lib/tools/record-user-turn';
 import { recordAssistantTurn } from '@/lib/tools/record-assistant-turn';
 import { getQueryResult } from '@/lib/tools/get-query-result';
+import { executeReadQuery } from '@/lib/tools/execute-read-query';
 
 /**
  * MCP server route handler.
@@ -110,6 +111,35 @@ const handler = createMcpHandler(
       async (params) => {
         try {
           return asTextResult(await getQueryResult(params));
+        } catch (err) {
+          return asErrorResult(err);
+        }
+      }
+    );
+
+    // ---- §4.4 execute_read_query ----
+    server.tool(
+      'execute_read_query',
+      'Executes a read-only SQL query synchronously against the substrate and returns rows + audit metadata inline. ' +
+        'Read-only enforcement is substrate-side: DML, DDL, and multi-statement queries are refused before execution. ' +
+        'Use for consent-free introspection mid-turn without a Flight Deck round-trip. ' +
+        'Implements Leg 1 of DOC-REQ-SPR138-001. Never executes writes.',
+      {
+        sql_text: z
+          .string()
+          .min(1)
+          .describe(
+            'The read-only SQL query to execute. Must be a single SELECT or equivalent read statement.'
+          ),
+        chat_id: z
+          .string()
+          .describe(
+            'Current chat ID (e.g. CHT-157). Passed as context for audit traceability.'
+          ),
+      },
+      async (params) => {
+        try {
+          return asTextResult(await executeReadQuery(params));
         } catch (err) {
           return asErrorResult(err);
         }
