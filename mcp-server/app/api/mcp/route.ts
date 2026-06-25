@@ -4,6 +4,7 @@ import { recordUserTurn } from '@/lib/tools/record-user-turn';
 import { recordAssistantTurn } from '@/lib/tools/record-assistant-turn';
 import { getQueryResult } from '@/lib/tools/get-query-result';
 import { executeReadQuery } from '@/lib/tools/execute-read-query';
+import { enqueueWrite } from '@/lib/tools/enqueue-write';
 
 /**
  * MCP server route handler.
@@ -140,6 +141,46 @@ const handler = createMcpHandler(
       async (params) => {
         try {
           return asTextResult(await executeReadQuery(params));
+        } catch (err) {
+          return asErrorResult(err);
+        }
+      }
+    );
+
+    // ---- §4.5 enqueue_write ----
+    server.tool(
+      'enqueue_write',
+      'Enqueues a structured stored-procedure call into the Flight Deck execution queue. ' +
+        'Accepts an SP name and JSONB parameter object; builds the SQL as SELECT sp_name(params::jsonb) ' +
+        'and inserts it via enqueue_pending_query. Returns a queue_entry_id. ' +
+        'Raw DML and DDL are refused — only SP calls are accepted. ' +
+        'The human operator gate (Paul approves in Flight Deck) is unchanged: this tool enqueues only, never executes. ' +
+        'Implements Leg 2 of DOC-REQ-SPR138-001.',
+      {
+        chat_id: z
+          .string()
+          .describe('Current chat ID (e.g. CHT-159). Used for audit traceability.'),
+        source_turn_id: z
+          .string()
+          .describe('The turn ID of the assistant turn that is requesting the write (e.g. TURN-CHT-159-0012).'),
+        sp_name: z
+          .string()
+          .min(1)
+          .describe(
+            'Substrate stored procedure name (e.g. seed_tickets, seed_decisions, resolve_ticket). ' +
+              'Must be a valid PostgreSQL identifier: lowercase letters, digits, underscores only.'
+          ),
+        sp_params: z
+          .record(z.unknown())
+          .describe(
+            'Parameters to pass to the SP as a JSONB object. ' +
+              'Keys and value types must match the SP signature. ' +
+              'Example: { "p_ticket_id": "MT-669", "p_resolution_note": "Fixed." }'
+          ),
+      },
+      async (params) => {
+        try {
+          return asTextResult(await enqueueWrite(params));
         } catch (err) {
           return asErrorResult(err);
         }
